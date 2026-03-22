@@ -1,26 +1,34 @@
 // ============================================================
 // Analytics.jsx
-// Drop-in Analytics page for the team expense tracker app.
+// Expense Analytics page with modular vanilla JS functions.
 //
-// Dependencies (already in your project):
-//   - Firebase Firestore  (firebase/firestore)
-//   - useAuth context     (../contexts/AuthContext or wherever yours lives)
-//   - Tailwind CSS
-//   - Chart.js            (npm install chart.js)
+// ALL analytics logic is written as pure vanilla JavaScript
+// utility functions (no framework dependency). The React
+// component at the bottom is a thin wrapper that wires
+// these functions into the existing app.
 //
-// Adjust the import path for useAuth to match your project.
+// Dependencies:
+//   - Firebase Firestore (data source)
+//   - Chart.js (already in package.json)
+//   - Tailwind CSS (styling)
 // ============================================================
 
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { collection, query, where, getDocs } from "firebase/firestore";
-import { db } from "../firebase";           // ← your Firebase init file
-import { useAuth } from "../context/AuthContext"; // ← adjust path if needed
+import { db } from "../firebase";
+import { useAuth } from "../context/AuthContext";
 import { Chart, registerables } from "chart.js";
 
 Chart.register(...registerables);
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ╔══════════════════════════════════════════════════════════════╗
+// ║          SECTION 1 — PURE VANILLA JS UTILITY FUNCTIONS      ║
+// ║   No React. No Firebase. Just plain JavaScript.             ║
+// ╚══════════════════════════════════════════════════════════════╝
 
+// ─── Constants ────────────────────────────────────────────────
+
+/** Category → color mapping used across charts and UI */
 const CATEGORY_COLORS = {
     Food: "#f87171",
     Transport: "#60a5fa",
@@ -32,183 +40,402 @@ const CATEGORY_COLORS = {
     Other: "#94a3b8",
 };
 
+/** Fallback color for unknown categories */
+const DEFAULT_COLOR = "#94a3b8";
+
+/** Day labels for weekly charts (Sunday-first to match JS Date.getDay()) */
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-// ─── Utility helpers ──────────────────────────────────────────────────────────
+/** Short month names for trend charts */
+const MONTH_NAMES = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
-/** Format a number as INR currency (swap locale/currency as needed) */
-const fmt = (n) =>
-    new Intl.NumberFormat("en-IN", {
+// ─── Formatting helper ───────────────────────────────────────
+
+/**
+ * Format a number as INR currency.
+ * Change locale / currency for your region.
+ * @param {number} n - Amount to format
+ * @returns {string} Formatted currency string
+ */
+function fmt(n) {
+    return new Intl.NumberFormat("en-IN", {
         style: "currency",
         currency: "INR",
         maximumFractionDigits: 0,
     }).format(n ?? 0);
-
-/** Returns { year, month } for a Date object */
-const ym = (d) => ({ year: d.getFullYear(), month: d.getMonth() });
-
-/** True if expense date falls in the given { year, month } */
-const inMonth = (isoDate, year, month) => {
-    const d = new Date(isoDate);
-    return d.getFullYear() === year && d.getMonth() === month;
-};
-
-/** Returns Monday–Sunday bounds of the week containing `now` */
-function getWeekBounds(now = new Date()) {
-    const day = now.getDay(); // 0 = Sun
-    const sun = new Date(now);
-    sun.setDate(now.getDate() - day);
-    sun.setHours(0, 0, 0, 0);
-    const sat = new Date(sun);
-    sat.setDate(sun.getDate() + 6);
-    sat.setHours(23, 59, 59, 999);
-    return { sun, sat };
 }
 
-/** Group an expense array by category → { [cat]: total } */
-function groupByCategory(expenses) {
+// ─── 1. getMonthlyReport(expenses) ───────────────────────────
+
+/**
+ * Filter expenses for the current calendar month, calculate
+ * the total, and group by category.
+ *
+ * @param {Array<{id:string, amount:number, category:string, date:string}>} expenses
+ * @returns {{
+ *   month: number,
+ *   year: number,
+ *   total: number,
+ *   count: number,
+ *   categoryBreakdown: Object<string, number>,
+ *   expenses: Array
+ * }}
+ */
+function getMonthlyReport(expenses) {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth(); // 0-indexed
+
+    // Filter expenses that fall in the current month
+    const filtered = expenses.filter((e) => {
+        const d = new Date(e.date);
+        return d.getFullYear() === year && d.getMonth() === month;
+    });
+
+    // Calculate total spending
+    const total = filtered.reduce((sum, e) => sum + (e.amount || 0), 0);
+
+    // Group by category → { Food: 1500, Transport: 800, ... }
+    const categoryBreakdown = getCategoryTotals(filtered);
+
+    return {
+        month,
+        year,
+        total,
+        count: filtered.length,
+        categoryBreakdown,
+        expenses: filtered,
+    };
+}
+
+// ─── 2. getWeeklyReport(expenses) ────────────────────────────
+
+/**
+ * Filter expenses for the current week (Sunday → Saturday),
+ * calculate total, and provide a day-by-day breakdown.
+ *
+ * @param {Array<{id:string, amount:number, category:string, date:string}>} expenses
+ * @returns {{
+ *   total: number,
+ *   count: number,
+ *   dailyBreakdown: number[],   // 7 elements [Sun, Mon, ..., Sat]
+ *   weekStart: Date,
+ *   weekEnd: Date,
+ *   expenses: Array
+ * }}
+ */
+function getWeeklyReport(expenses) {
+    const now = new Date();
+
+    // Find Sunday (start of week)
+    const dayOfWeek = now.getDay(); // 0 = Sun
+    const weekStart = new Date(now);
+    weekStart.setDate(now.getDate() - dayOfWeek);
+    weekStart.setHours(0, 0, 0, 0);
+
+    // Find Saturday (end of week)
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekStart.getDate() + 6);
+    weekEnd.setHours(23, 59, 59, 999);
+
+    // Filter expenses within this week
+    const filtered = expenses.filter((e) => {
+        const d = new Date(e.date);
+        return d >= weekStart && d <= weekEnd;
+    });
+
+    // Build daily breakdown array: index 0 = Sun, 6 = Sat
+    const dailyBreakdown = Array(7).fill(0);
+    filtered.forEach((e) => {
+        const dayIdx = new Date(e.date).getDay();
+        dailyBreakdown[dayIdx] += e.amount || 0;
+    });
+
+    const total = dailyBreakdown.reduce((a, b) => a + b, 0);
+
+    return {
+        total,
+        count: filtered.length,
+        dailyBreakdown,
+        weekStart,
+        weekEnd,
+        expenses: filtered,
+    };
+}
+
+// ─── 3. getCategoryTotals(expenses) ──────────────────────────
+
+/**
+ * Group expenses by category and sum amounts.
+ *
+ * @param {Array<{id:string, amount:number, category:string, date:string}>} expenses
+ * @returns {Object<string, number>}  e.g. { Food: 2500, Transport: 1200 }
+ */
+function getCategoryTotals(expenses) {
     return expenses.reduce((acc, e) => {
-        acc[e.category] = (acc[e.category] || 0) + e.amount;
+        const cat = e.category || "Other";
+        acc[cat] = (acc[cat] || 0) + (e.amount || 0);
         return acc;
     }, {});
 }
 
-// ─── Reusable Chart Wrappers ──────────────────────────────────────────────────
+// ─── 4. getTrendData(expenses, months) ───────────────────────
 
 /**
- * Doughnut / Pie chart for category breakdown.
- * Destroys and recreates the Chart.js instance whenever `data` changes.
+ * Compare spending across the last N months.
+ * Returns monthly totals and percentage changes between
+ * consecutive months, plus a simple trend indicator.
+ *
+ * @param {Array<{id:string, amount:number, category:string, date:string}>} expenses
+ * @param {number} [months=6] - Number of past months to compare
+ * @returns {{
+ *   months: Array<{month:number, year:number, label:string, total:number}>,
+ *   changes: Array<{pct:number|null, direction:string}>,
+ *   overallTrend: string
+ * }}
  */
-function CategoryPieChart({ data }) {
-    const canvasRef = useRef(null);
-    const chartRef = useRef(null);
+function getTrendData(expenses, months = 6) {
+    const now = new Date();
+    const result = [];
 
-    useEffect(() => {
-        if (!canvasRef.current) return;
+    // Build totals for each of the last `months` months
+    for (let i = months - 1; i >= 0; i--) {
+        const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        const year = d.getFullYear();
+        const month = d.getMonth();
 
-        // Destroy previous instance to avoid "Canvas already in use" error
-        if (chartRef.current) {
-            chartRef.current.destroy();
-            chartRef.current = null;
+        // Sum expenses for this month
+        const total = expenses
+            .filter((e) => {
+                const ed = new Date(e.date);
+                return ed.getFullYear() === year && ed.getMonth() === month;
+            })
+            .reduce((sum, e) => sum + (e.amount || 0), 0);
+
+        result.push({
+            month,
+            year,
+            label: `${MONTH_NAMES[month]} ${year}`,
+            total,
+        });
+    }
+
+    // Calculate percentage change between consecutive months
+    const changes = [];
+    for (let i = 1; i < result.length; i++) {
+        const prev = result[i - 1].total;
+        const curr = result[i].total;
+
+        if (prev === 0) {
+            changes.push({ pct: curr > 0 ? 100 : 0, direction: curr > 0 ? "up" : "flat" });
+        } else {
+            const pct = ((curr - prev) / prev) * 100;
+            const direction = pct > 0 ? "up" : pct < 0 ? "down" : "flat";
+            changes.push({ pct: Math.round(pct * 10) / 10, direction });
         }
+    }
 
-        const labels = Object.keys(data);
-        const values = Object.values(data);
-        if (labels.length === 0) return;
+    // Overall trend: compare first and last month
+    let overallTrend = "flat";
+    if (result.length >= 2) {
+        const first = result[0].total;
+        const last = result[result.length - 1].total;
+        if (last > first) overallTrend = "up";
+        else if (last < first) overallTrend = "down";
+    }
 
-        chartRef.current = new Chart(canvasRef.current, {
-            type: "doughnut",
-            data: {
-                labels,
-                datasets: [
-                    {
-                        data: values,
-                        backgroundColor: labels.map((l) => CATEGORY_COLORS[l] || "#94a3b8"),
-                        borderColor: "#0f172a",
-                        borderWidth: 2,
-                    },
-                ],
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                cutout: "62%",
-                plugins: {
-                    legend: { display: false },
-                    tooltip: {
-                        callbacks: {
-                            label: (ctx) => {
-                                const total = values.reduce((a, b) => a + b, 0);
-                                return ` ${fmt(ctx.raw)}  (${((ctx.raw / total) * 100).toFixed(1)}%)`;
-                            },
+    return { months: result, changes, overallTrend };
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║          SECTION 2 — CHART.JS RENDERING FUNCTIONS           ║
+// ║   Vanilla JS — accepts a canvas element and data.           ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+/**
+ * Render (or re-render) a Doughnut/Pie chart on a canvas element.
+ * Returns the Chart instance so it can be destroyed later.
+ *
+ * @param {HTMLCanvasElement} canvasEl - Target canvas
+ * @param {Object<string, number>} categoryData - { Food: 2500, ... }
+ * @param {Chart|null} existingChart - Previous instance to destroy
+ * @returns {Chart} The new Chart.js instance
+ */
+function renderPieChart(canvasEl, categoryData, existingChart = null) {
+    // Destroy old chart if it exists (prevents "Canvas already in use" error)
+    if (existingChart) {
+        existingChart.destroy();
+    }
+
+    const labels = Object.keys(categoryData);
+    const values = Object.values(categoryData);
+    const colors = labels.map((l) => CATEGORY_COLORS[l] || DEFAULT_COLOR);
+
+    return new Chart(canvasEl, {
+        type: "doughnut",
+        data: {
+            labels,
+            datasets: [
+                {
+                    data: values,
+                    backgroundColor: colors,
+                    borderColor: "#0f172a",
+                    borderWidth: 2,
+                },
+            ],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            cutout: "62%",
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: {
+                        label: (ctx) => {
+                            const total = values.reduce((a, b) => a + b, 0);
+                            const pct = ((ctx.raw / total) * 100).toFixed(1);
+                            return ` ${fmt(ctx.raw)}  (${pct}%)`;
                         },
                     },
                 },
             },
-        });
-
-        return () => {
-            if (chartRef.current) {
-                chartRef.current.destroy();
-                chartRef.current = null;
-            }
-        };
-    }, [data]); // re-render chart when data changes
-
-    return (
-        <div className="relative" style={{ height: 220 }}>
-            <canvas ref={canvasRef} />
-        </div>
-    );
+        },
+    });
 }
 
 /**
- * Bar chart for weekly day-by-day spending.
+ * Render (or re-render) a Bar chart showing daily spending.
+ *
+ * @param {HTMLCanvasElement} canvasEl - Target canvas
+ * @param {number[]} dayTotals - Array of 7 numbers [Sun..Sat]
+ * @param {Chart|null} existingChart - Previous instance to destroy
+ * @returns {Chart} The new Chart.js instance
  */
-function WeeklyBarChart({ dayTotals }) {
-    const canvasRef = useRef(null);
-    const chartRef = useRef(null);
+function renderBarChart(canvasEl, dayTotals, existingChart = null) {
+    if (existingChart) {
+        existingChart.destroy();
+    }
 
-    useEffect(() => {
-        if (!canvasRef.current) return;
-        if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
+    const todayIdx = new Date().getDay();
 
-        chartRef.current = new Chart(canvasRef.current, {
-            type: "bar",
-            data: {
-                labels: DAY_LABELS,
-                datasets: [
-                    {
-                        label: "Spending",
-                        data: dayTotals,
-                        backgroundColor: dayTotals.map((_, i) => {
-                            const today = new Date().getDay();
-                            return i === today ? "#60a5fa" : "#1e3a5f";
-                        }),
-                        borderRadius: 6,
-                        borderSkipped: false,
-                    },
-                ],
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: {
-                    legend: { display: false },
-                    tooltip: { callbacks: { label: (ctx) => ` ${fmt(ctx.raw)}` } },
+    return new Chart(canvasEl, {
+        type: "bar",
+        data: {
+            labels: DAY_LABELS,
+            datasets: [
+                {
+                    label: "Spending",
+                    data: dayTotals,
+                    backgroundColor: dayTotals.map((_, i) =>
+                        i === todayIdx ? "#60a5fa" : "#1e3a5f"
+                    ),
+                    borderRadius: 6,
+                    borderSkipped: false,
                 },
-                scales: {
-                    x: {
-                        ticks: { color: "#94a3b8", font: { size: 12 } },
-                        grid: { display: false },
-                    },
-                    y: {
-                        ticks: {
-                            color: "#94a3b8",
-                            font: { size: 11 },
-                            callback: (v) => "₹" + (v >= 1000 ? (v / 1000).toFixed(0) + "k" : v),
-                        },
-                        grid: { color: "rgba(148,163,184,0.08)" },
-                    },
+            ],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: { label: (ctx) => ` ${fmt(ctx.raw)}` },
                 },
             },
-        });
-
-        return () => {
-            if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
-        };
-    }, [dayTotals]);
-
-    return (
-        <div className="relative" style={{ height: 200 }}>
-            <canvas ref={canvasRef} />
-        </div>
-    );
+            scales: {
+                x: {
+                    ticks: { color: "#94a3b8", font: { size: 12 } },
+                    grid: { display: false },
+                },
+                y: {
+                    ticks: {
+                        color: "#94a3b8",
+                        font: { size: 11 },
+                        callback: (v) =>
+                            "₹" + (v >= 1000 ? (v / 1000).toFixed(0) + "k" : v),
+                    },
+                    grid: { color: "rgba(148,163,184,0.08)" },
+                },
+            },
+        },
+    });
 }
 
-// ─── Sub-components ───────────────────────────────────────────────────────────
+/**
+ * Render a trend line chart showing monthly spending over time.
+ *
+ * @param {HTMLCanvasElement} canvasEl - Target canvas
+ * @param {Array<{label:string, total:number}>} monthlyData - From getTrendData().months
+ * @param {Chart|null} existingChart - Previous instance to destroy
+ * @returns {Chart} The new Chart.js instance
+ */
+function renderTrendChart(canvasEl, monthlyData, existingChart = null) {
+    if (existingChart) {
+        existingChart.destroy();
+    }
 
-/** Simple KPI card */
+    return new Chart(canvasEl, {
+        type: "line",
+        data: {
+            labels: monthlyData.map((m) => m.label),
+            datasets: [
+                {
+                    label: "Monthly Spending",
+                    data: monthlyData.map((m) => m.total),
+                    borderColor: "#60a5fa",
+                    backgroundColor: "rgba(96, 165, 250, 0.1)",
+                    borderWidth: 2,
+                    pointBackgroundColor: "#60a5fa",
+                    pointBorderColor: "#0f172a",
+                    pointBorderWidth: 2,
+                    pointRadius: 5,
+                    tension: 0.3,
+                    fill: true,
+                },
+            ],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: {
+                    callbacks: { label: (ctx) => ` ${fmt(ctx.raw)}` },
+                },
+            },
+            scales: {
+                x: {
+                    ticks: { color: "#94a3b8", font: { size: 11 } },
+                    grid: { display: false },
+                },
+                y: {
+                    ticks: {
+                        color: "#94a3b8",
+                        font: { size: 11 },
+                        callback: (v) =>
+                            "₹" + (v >= 1000 ? (v / 1000).toFixed(0) + "k" : v),
+                    },
+                    grid: { color: "rgba(148,163,184,0.08)" },
+                },
+            },
+        },
+    });
+}
+
+// ╔══════════════════════════════════════════════════════════════╗
+// ║          SECTION 3 — REACT COMPONENT (THIN WRAPPER)         ║
+// ║   Only responsible for Firebase fetch, state, and JSX.      ║
+// ║   All logic delegates to the vanilla functions above.       ║
+// ╚══════════════════════════════════════════════════════════════╝
+
+// ─── Small UI sub-components ─────────────────────────────────
+
+/** KPI stat card */
 function StatCard({ label, value, sub, trendPct }) {
     const up = trendPct > 0;
     const neutral = trendPct == null;
@@ -229,26 +456,18 @@ function StatCard({ label, value, sub, trendPct }) {
 /** Category row in the breakdown list */
 function CategoryRow({ name, amount, total }) {
     const pct = total > 0 ? (amount / total) * 100 : 0;
-    const color = CATEGORY_COLORS[name] || "#94a3b8";
+    const color = CATEGORY_COLORS[name] || DEFAULT_COLOR;
     return (
         <div className="flex items-center gap-3 py-2">
-            {/* Color dot */}
-            <span
-                className="w-2.5 h-2.5 rounded-sm flex-shrink-0"
-                style={{ background: color }}
-            />
-            {/* Name */}
+            <span className="w-2.5 h-2.5 rounded-sm flex-shrink-0" style={{ background: color }} />
             <span className="text-sm text-slate-300 flex-1 truncate">{name}</span>
-            {/* Progress bar */}
             <div className="w-24 bg-slate-700 rounded-full h-1.5 hidden sm:block">
                 <div
                     className="h-1.5 rounded-full transition-all duration-500"
                     style={{ width: `${pct}%`, background: color }}
                 />
             </div>
-            {/* Percentage */}
             <span className="text-xs text-slate-500 w-9 text-right">{pct.toFixed(0)}%</span>
-            {/* Amount */}
             <span className="text-sm font-medium text-white w-20 text-right">{fmt(amount)}</span>
         </div>
     );
@@ -273,10 +492,10 @@ function Empty({ message = "No expenses found for this period." }) {
         <div className="flex flex-col items-center justify-center py-10 gap-2 text-slate-500">
             <svg width="32" height="32" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                 <path strokeLinecap="round" strokeLinejoin="round"
-                    d="M2.25 18.75a60.07 60.07 0 0115.797 2.101c.727.198 1.453-.342 
+                    d="M2.25 18.75a60.07 60.07 0 0115.797 2.101c.727.198 1.453-.342
              1.453-1.096V18.75M3.75 4.5v.75A.75.75 0 013 6h-.75m0 0v-.375
              c0-.621.504-1.125 1.125-1.125H20.25M2.25 6v9m18-10.5v.75
-             c0 .414.336.75.75.75h.75m-1.5-1.5h.375c.621 0 1.125.504 1.125 
+             c0 .414.336.75.75.75h.75m-1.5-1.5h.375c.621 0 1.125.504 1.125
              1.125v9.75c0 .621-.504 1.125-1.125 1.125h-.375m1.5-1.5H21
              a.75.75 0 00-.75.75v.75m0 0H3.75m0 0h-.375
              a1.125 1.125 0 01-1.125-1.125V15m1.5 1.5l-3.719-3.719
@@ -291,31 +510,32 @@ function Empty({ message = "No expenses found for this period." }) {
 function Loader() {
     return (
         <div className="flex items-center justify-center py-16">
-            <svg
-                className="animate-spin h-8 w-8 text-blue-400"
-                xmlns="http://www.w3.org/2000/svg"
-                fill="none"
-                viewBox="0 0 24 24"
-            >
-                <circle className="opacity-25" cx="12" cy="12" r="10"
-                    stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor"
-                    d="M4 12a8 8 0 018-8v8H4z" />
+            <svg className="animate-spin h-8 w-8 text-blue-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
             </svg>
         </div>
     );
 }
 
-// ─── Main Analytics Component ─────────────────────────────────────────────────
+// ─── Main Analytics Component ─────────────────────────────────
 
 export default function Analytics() {
     // ── Auth ──────────────────────────────────────────────────
     const { currentUser } = useAuth();
 
     // ── State ─────────────────────────────────────────────────
-    const [expenses, setExpenses] = useState([]);  // all expenses for this user
+    const [expenses, setExpenses] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+
+    // ── Canvas refs for Chart.js ──────────────────────────────
+    const pieCanvasRef = useRef(null);
+    const barCanvasRef = useRef(null);
+    const trendCanvasRef = useRef(null);
+    const pieChartRef = useRef(null);
+    const barChartRef = useRef(null);
+    const trendChartRef = useRef(null);
 
     // ── Fetch from Firestore ──────────────────────────────────
     useEffect(() => {
@@ -325,7 +545,6 @@ export default function Analytics() {
             setLoading(true);
             setError(null);
             try {
-                // Query: only documents belonging to the logged-in user
                 const q = query(
                     collection(db, "expenses"),
                     where("userId", "==", currentUser.uid)
@@ -347,69 +566,86 @@ export default function Analytics() {
         fetchExpenses();
     }, [currentUser]);
 
-    // ── Date anchors ──────────────────────────────────────────
-    const now = new Date();
-    const thisYM = ym(now);
-    const prevDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    const prevYM = ym(prevDate);
+    // ── Derived data using vanilla JS functions ───────────────
+    const monthlyReport = useMemo(() => getMonthlyReport(expenses), [expenses]);
+    const weeklyReport = useMemo(() => getWeeklyReport(expenses), [expenses]);
+    const trendData = useMemo(() => getTrendData(expenses, 6), [expenses]);
 
-    // ── Derived data (memoised for performance) ───────────────
-
-    /** All expenses that belong to the current calendar month */
-    const thisMonthExp = useMemo(
-        () => expenses.filter((e) => inMonth(e.date, thisYM.year, thisYM.month)),
-        [expenses, thisYM.year, thisYM.month]
-    );
-
-    /** All expenses that belong to the previous calendar month */
-    const prevMonthExp = useMemo(
-        () => expenses.filter((e) => inMonth(e.date, prevYM.year, prevYM.month)),
-        [expenses, prevYM.year, prevYM.month]
-    );
-
-    /** Sum helpers */
-    const sum = (arr) => arr.reduce((s, e) => s + (e.amount || 0), 0);
-    const thisMonthTotal = useMemo(() => sum(thisMonthExp), [thisMonthExp]);
-    const prevMonthTotal = useMemo(() => sum(prevMonthExp), [prevMonthExp]);
-
-    /** % change: positive = spending went up, negative = spending went down */
-    const trendPct = useMemo(() => {
-        if (prevMonthTotal === 0) return null;
-        return ((thisMonthTotal - prevMonthTotal) / prevMonthTotal) * 100;
-    }, [thisMonthTotal, prevMonthTotal]);
-
-    /** Category breakdown for current month */
-    const catBreakdown = useMemo(
-        () => groupByCategory(thisMonthExp),
-        [thisMonthExp]
-    );
-
-    /** Sorted category entries (highest first) */
-    const sortedCategories = useMemo(
-        () => Object.entries(catBreakdown).sort((a, b) => b[1] - a[1]),
-        [catBreakdown]
-    );
-
-    /** Daily totals for Sun–Sat of the current week */
-    const weeklyDayTotals = useMemo(() => {
-        const { sun, sat } = getWeekBounds(now);
-        const weekExp = expenses.filter((e) => {
-            const d = new Date(e.date);
-            return d >= sun && d <= sat;
-        });
-        // Build array of 7 zeros (index = day-of-week 0=Sun…6=Sat)
-        const totals = Array(7).fill(0);
-        weekExp.forEach((e) => {
-            const dayIdx = new Date(e.date).getDay();
-            totals[dayIdx] += e.amount || 0;
-        });
-        return totals;
+    // Previous month total for comparison
+    const prevMonthTotal = useMemo(() => {
+        const now = new Date();
+        const prevYear = now.getMonth() === 0 ? now.getFullYear() - 1 : now.getFullYear();
+        const prevMonth = now.getMonth() === 0 ? 11 : now.getMonth() - 1;
+        return expenses
+            .filter((e) => {
+                const d = new Date(e.date);
+                return d.getFullYear() === prevYear && d.getMonth() === prevMonth;
+            })
+            .reduce((sum, e) => sum + (e.amount || 0), 0);
     }, [expenses]);
 
-    const weeklyTotal = useMemo(
-        () => weeklyDayTotals.reduce((a, b) => a + b, 0),
-        [weeklyDayTotals]
+    // Trend percentage: current vs previous month
+    const trendPct = useMemo(() => {
+        if (prevMonthTotal === 0) return null;
+        return ((monthlyReport.total - prevMonthTotal) / prevMonthTotal) * 100;
+    }, [monthlyReport.total, prevMonthTotal]);
+
+    // Sorted categories for display (highest first)
+    const sortedCategories = useMemo(
+        () => Object.entries(monthlyReport.categoryBreakdown).sort((a, b) => b[1] - a[1]),
+        [monthlyReport.categoryBreakdown]
     );
+
+    const now = new Date();
+
+    // ── Chart rendering via vanilla JS functions ──────────────
+    // Pie chart: category distribution
+    useEffect(() => {
+        if (!pieCanvasRef.current || sortedCategories.length === 0) return;
+        pieChartRef.current = renderPieChart(
+            pieCanvasRef.current,
+            monthlyReport.categoryBreakdown,
+            pieChartRef.current
+        );
+        return () => {
+            if (pieChartRef.current) {
+                pieChartRef.current.destroy();
+                pieChartRef.current = null;
+            }
+        };
+    }, [monthlyReport.categoryBreakdown, sortedCategories.length]);
+
+    // Bar chart: weekly daily breakdown
+    useEffect(() => {
+        if (!barCanvasRef.current || weeklyReport.total === 0) return;
+        barChartRef.current = renderBarChart(
+            barCanvasRef.current,
+            weeklyReport.dailyBreakdown,
+            barChartRef.current
+        );
+        return () => {
+            if (barChartRef.current) {
+                barChartRef.current.destroy();
+                barChartRef.current = null;
+            }
+        };
+    }, [weeklyReport.dailyBreakdown, weeklyReport.total]);
+
+    // Line chart: monthly trend
+    useEffect(() => {
+        if (!trendCanvasRef.current || trendData.months.length === 0) return;
+        trendChartRef.current = renderTrendChart(
+            trendCanvasRef.current,
+            trendData.months,
+            trendChartRef.current
+        );
+        return () => {
+            if (trendChartRef.current) {
+                trendChartRef.current.destroy();
+                trendChartRef.current = null;
+            }
+        };
+    }, [trendData.months]);
 
     // ── Render ────────────────────────────────────────────────
     if (!currentUser) {
@@ -435,8 +671,7 @@ export default function Analytics() {
 
             {/* ── Error Banner ── */}
             {error && (
-                <div className="mb-6 bg-red-900/40 border border-red-700 text-red-300
-                        text-sm rounded-xl px-4 py-3">
+                <div className="mb-6 bg-red-900/40 border border-red-700 text-red-300 text-sm rounded-xl px-4 py-3">
                     {error}
                 </div>
             )}
@@ -447,36 +682,36 @@ export default function Analytics() {
             ) : (
                 <div className="grid gap-6">
 
-                    {/* ── Row 1: KPI Cards ── */}
+                    {/* ── Row 1: KPI Stat Cards ── */}
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                         <StatCard
                             label="This Month"
-                            value={fmt(thisMonthTotal)}
-                            sub={`${thisMonthExp.length} transactions`}
+                            value={fmt(monthlyReport.total)}
+                            sub={`${monthlyReport.count} transactions`}
                             trendPct={trendPct}
                         />
                         <StatCard
                             label="Last Month"
                             value={fmt(prevMonthTotal)}
-                            sub={`${prevMonthExp.length} transactions`}
+                            sub={`previous period`}
                         />
                         <StatCard
                             label="This Week"
-                            value={fmt(weeklyTotal)}
+                            value={fmt(weeklyReport.total)}
                             sub="Sun – Sat"
                         />
                         <StatCard
                             label="Daily Average"
-                            value={fmt(thisMonthTotal / (now.getDate() || 1))}
+                            value={fmt(monthlyReport.total / (now.getDate() || 1))}
                             sub="this month"
                         />
                     </div>
 
-                    {/* ── Row 2: Category Breakdown + Pie Chart ── */}
+                    {/* ── Row 2: Monthly Report — Category Breakdown + Pie Chart ── */}
                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
                         {/* Category List */}
-                        <Section title="Category Breakdown">
+                        <Section title="Monthly Report — Category Breakdown">
                             {sortedCategories.length === 0 ? (
                                 <Empty />
                             ) : (
@@ -486,27 +721,29 @@ export default function Analytics() {
                                             key={name}
                                             name={name}
                                             amount={amount}
-                                            total={thisMonthTotal}
+                                            total={monthlyReport.total}
                                         />
                                     ))}
                                 </div>
                             )}
                         </Section>
 
-                        {/* Pie Chart */}
+                        {/* Pie / Doughnut Chart */}
                         <Section title="Category Distribution">
                             {sortedCategories.length === 0 ? (
                                 <Empty />
                             ) : (
                                 <>
-                                    <CategoryPieChart data={catBreakdown} />
-                                    {/* Custom legend below chart */}
+                                    <div className="relative" style={{ height: 220 }}>
+                                        <canvas ref={pieCanvasRef} />
+                                    </div>
+                                    {/* Custom legend */}
                                     <div className="flex flex-wrap gap-x-4 gap-y-2 mt-4 justify-center">
                                         {sortedCategories.map(([name]) => (
                                             <span key={name} className="flex items-center gap-1.5 text-xs text-slate-400">
                                                 <span
                                                     className="w-2 h-2 rounded-sm"
-                                                    style={{ background: CATEGORY_COLORS[name] || "#94a3b8" }}
+                                                    style={{ background: CATEGORY_COLORS[name] || DEFAULT_COLOR }}
                                                 />
                                                 {name}
                                             </span>
@@ -517,19 +754,21 @@ export default function Analytics() {
                         </Section>
                     </div>
 
-                    {/* ── Row 3: Weekly Bar Chart ── */}
+                    {/* ── Row 3: Weekly Report — Bar Chart ── */}
                     <Section
-                        title="Weekly Spending"
+                        title="Weekly Report"
                         action={
                             <span className="text-xs text-slate-500">
-                                Total: <span className="text-white font-medium">{fmt(weeklyTotal)}</span>
+                                Total: <span className="text-white font-medium">{fmt(weeklyReport.total)}</span>
                             </span>
                         }
                     >
-                        {weeklyTotal === 0 ? (
+                        {weeklyReport.total === 0 ? (
                             <Empty message="No spending recorded this week." />
                         ) : (
-                            <WeeklyBarChart dayTotals={weeklyDayTotals} />
+                            <div className="relative" style={{ height: 200 }}>
+                                <canvas ref={barCanvasRef} />
+                            </div>
                         )}
 
                         {/* Day-by-day summary below chart */}
@@ -546,10 +785,10 @@ export default function Analytics() {
                                             {day}
                                         </p>
                                         <p className="text-xs font-medium text-white truncate">
-                                            {weeklyDayTotals[i] > 0
-                                                ? "₹" + (weeklyDayTotals[i] >= 1000
-                                                    ? (weeklyDayTotals[i] / 1000).toFixed(1) + "k"
-                                                    : weeklyDayTotals[i].toFixed(0))
+                                            {weeklyReport.dailyBreakdown[i] > 0
+                                                ? "₹" + (weeklyReport.dailyBreakdown[i] >= 1000
+                                                    ? (weeklyReport.dailyBreakdown[i] / 1000).toFixed(1) + "k"
+                                                    : weeklyReport.dailyBreakdown[i].toFixed(0))
                                                 : "—"}
                                         </p>
                                     </div>
@@ -558,64 +797,87 @@ export default function Analytics() {
                         </div>
                     </Section>
 
-                    {/* ── Row 4: Month-over-Month Trend ── */}
-                    <Section title="Monthly Trend">
-                        <div className="flex flex-col sm:flex-row gap-6 items-start sm:items-center">
+                    {/* ── Row 4: Expense Trends (last 6 months) ── */}
+                    <Section title="Expense Trends (Last 6 Months)">
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
-                            {/* Trend indicator block */}
-                            <div className="flex items-center gap-4">
-                                <div
-                                    className={`text-4xl font-bold ${trendPct == null
-                                        ? "text-slate-500"
-                                        : trendPct > 0
-                                            ? "text-red-400"
-                                            : "text-emerald-400"
-                                        }`}
-                                >
-                                    {trendPct == null
-                                        ? "—"
-                                        : (trendPct > 0 ? "↑ " : "↓ ") + Math.abs(trendPct).toFixed(1) + "%"}
-                                </div>
-                                <div className="text-sm text-slate-400 leading-relaxed">
-                                    {trendPct == null ? (
-                                        "No data for last month."
-                                    ) : trendPct > 0 ? (
-                                        <>Spending is <span className="text-red-400 font-medium">higher</span> than last month</>
-                                    ) : (
-                                        <>Spending is <span className="text-emerald-400 font-medium">lower</span> than last month</>
-                                    )}
+                            {/* Trend line chart */}
+                            <div>
+                                <div className="relative" style={{ height: 220 }}>
+                                    <canvas ref={trendCanvasRef} />
                                 </div>
                             </div>
 
-                            {/* Comparison pills */}
-                            <div className="flex gap-3 ml-auto flex-wrap">
-                                <div className="bg-slate-800 rounded-xl px-4 py-2 text-center min-w-[100px]">
-                                    <p className="text-xs text-slate-500 mb-1">This month</p>
-                                    <p className="text-sm font-semibold text-white">{fmt(thisMonthTotal)}</p>
-                                </div>
-                                <div className="bg-slate-800 rounded-xl px-4 py-2 text-center min-w-[100px]">
-                                    <p className="text-xs text-slate-500 mb-1">Last month</p>
-                                    <p className="text-sm font-semibold text-white">{fmt(prevMonthTotal)}</p>
-                                </div>
-                                <div
-                                    className={`rounded-xl px-4 py-2 text-center min-w-[100px] ${trendPct == null
-                                        ? "bg-slate-800"
-                                        : trendPct > 0
-                                            ? "bg-red-900/30"
-                                            : "bg-emerald-900/30"
-                                        }`}
-                                >
-                                    <p className="text-xs text-slate-500 mb-1">Difference</p>
-                                    <p
-                                        className={`text-sm font-semibold ${trendPct == null
-                                            ? "text-slate-400"
+                            {/* Trend details */}
+                            <div className="flex flex-col gap-4">
+                                {/* Overall trend indicator */}
+                                <div className="flex items-center gap-4">
+                                    <div
+                                        className={`text-4xl font-bold ${trendPct == null
+                                            ? "text-slate-500"
                                             : trendPct > 0
                                                 ? "text-red-400"
                                                 : "text-emerald-400"
                                             }`}
                                     >
-                                        {fmt(Math.abs(thisMonthTotal - prevMonthTotal))}
-                                    </p>
+                                        {trendPct == null
+                                            ? "—"
+                                            : (trendPct > 0 ? "↑ " : "↓ ") + Math.abs(trendPct).toFixed(1) + "%"}
+                                    </div>
+                                    <div className="text-sm text-slate-400 leading-relaxed">
+                                        {trendPct == null ? (
+                                            "No data for last month."
+                                        ) : trendPct > 0 ? (
+                                            <>Spending is <span className="text-red-400 font-medium">higher</span> than last month</>
+                                        ) : (
+                                            <>Spending is <span className="text-emerald-400 font-medium">lower</span> than last month</>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {/* Monthly breakdown pills */}
+                                <div className="flex gap-2 flex-wrap">
+                                    {trendData.months.map((m, i) => {
+                                        const change = trendData.changes[i - 1]; // changes[0] = between month 0→1
+                                        return (
+                                            <div key={m.label} className="bg-slate-800 rounded-xl px-3 py-2 text-center min-w-[80px]">
+                                                <p className="text-xs text-slate-500 mb-1">{m.label}</p>
+                                                <p className="text-sm font-semibold text-white">{fmt(m.total)}</p>
+                                                {change && (
+                                                    <p className={`text-xs mt-0.5 ${change.direction === "up" ? "text-red-400" : change.direction === "down" ? "text-emerald-400" : "text-slate-500"
+                                                        }`}>
+                                                        {change.direction === "up" ? "↑" : change.direction === "down" ? "↓" : "—"} {Math.abs(change.pct)}%
+                                                    </p>
+                                                )}
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+
+                                {/* Comparison pills */}
+                                <div className="flex gap-3 flex-wrap">
+                                    <div className="bg-slate-800 rounded-xl px-4 py-2 text-center min-w-[100px]">
+                                        <p className="text-xs text-slate-500 mb-1">This month</p>
+                                        <p className="text-sm font-semibold text-white">{fmt(monthlyReport.total)}</p>
+                                    </div>
+                                    <div className="bg-slate-800 rounded-xl px-4 py-2 text-center min-w-[100px]">
+                                        <p className="text-xs text-slate-500 mb-1">Last month</p>
+                                        <p className="text-sm font-semibold text-white">{fmt(prevMonthTotal)}</p>
+                                    </div>
+                                    <div
+                                        className={`rounded-xl px-4 py-2 text-center min-w-[100px] ${trendPct == null ? "bg-slate-800"
+                                            : trendPct > 0 ? "bg-red-900/30"
+                                                : "bg-emerald-900/30"
+                                            }`}
+                                    >
+                                        <p className="text-xs text-slate-500 mb-1">Difference</p>
+                                        <p className={`text-sm font-semibold ${trendPct == null ? "text-slate-400"
+                                            : trendPct > 0 ? "text-red-400"
+                                                : "text-emerald-400"
+                                            }`}>
+                                            {fmt(Math.abs(monthlyReport.total - prevMonthTotal))}
+                                        </p>
+                                    </div>
                                 </div>
                             </div>
                         </div>
